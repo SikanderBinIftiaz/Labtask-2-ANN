@@ -1,141 +1,319 @@
+
+from pathlib import Path
+
 import gradio as gr
 import pandas as pd
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
-df = pd.read_csv("student_mental_health_burnout.csv")
-df = df.drop_duplicates().dropna().reset_index(drop=True)
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report,
+)
 
-target_column = "burnout_level" if "burnout_level" in df.columns else df.columns[-1]
-X = pd.get_dummies(df.drop(columns=[target_column]), drop_first=False)
-encoder = LabelEncoder()
-y = encoder.fit_transform(df[target_column].astype(str))
+# --------------------------------------------------
+# 1. LOAD DATASET
+# --------------------------------------------------
 
-if len(encoder.classes_) < 2:
-    raise ValueError("The target column must contain at least two classes.")
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR / "MAGIC Gamma Telescope.csv"
 
-counts = pd.Series(y).value_counts()
-stratify = y if counts.min() >= 2 else None
+if not CSV_PATH.exists():
+    raise FileNotFoundError(
+        f"Dataset not found: {CSV_PATH}\n"
+        "Place MAGIC Gamma Telescope.csv in the same folder as app.py."
+    )
+
+df = pd.read_csv(CSV_PATH, sep=None, engine="python")
+
+# Clean column names and remove an unnecessary saved index column.
+df.columns = df.columns.astype(str).str.strip()
+df = df.loc[
+    :,
+    ~df.columns.str.match(r"^Unnamed", case=False)
+]
+
+# Find the target column, ignoring capitalization.
+target_matches = [
+    column for column in df.columns
+    if column.strip().lower() == "class"
+]
+
+if not target_matches:
+    raise ValueError(
+        "The CSV must contain a target column named 'class'. "
+        "Check the column names in your CSV file."
+    )
+
+TARGET = target_matches[0]
+
+# Remove empty rows and duplicate rows.
+df = df.dropna().drop_duplicates().reset_index(drop=True)
+
+# Prepare features and target.
+X = df.drop(columns=[TARGET]).copy()
+y_text = df[TARGET].astype(str).str.strip().str.lower()
+
+# Convert all feature columns to numeric values.
+X = X.apply(pd.to_numeric, errors="coerce")
+
+# Remove rows containing invalid feature values.
+valid_rows = X.notna().all(axis=1) & y_text.notna()
+X = X.loc[valid_rows].reset_index(drop=True)
+y_text = y_text.loc[valid_rows].reset_index(drop=True)
+
+if X.empty:
+    raise ValueError("No usable rows were found in the CSV file.")
+
+if y_text.nunique() < 2:
+    raise ValueError("The class column must contain at least two classes.")
+
+# Encode labels, such as g and h.
+label_encoder = LabelEncoder()
+y = label_encoder.fit_transform(y_text)
+
+if len(label_encoder.classes_) != 2:
+    raise ValueError(
+        "This app expects two classes, normally 'g' and 'h'. "
+        f"Found: {list(label_encoder.classes_)}"
+    )
+
+if pd.Series(y).value_counts().min() < 2:
+    raise ValueError(
+        "Each class needs at least two rows to create a stratified train/test split."
+    )
+
+# --------------------------------------------------
+# 2. SPLIT DATA AND TRAIN LOGISTIC REGRESSION
+# --------------------------------------------------
 
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=stratify
+    X,
+    y,
+    test_size=0.20,
+    random_state=42,
+    stratify=y,
 )
 
 model = Pipeline([
     ("scaler", StandardScaler()),
-    ("classifier", LogisticRegression(max_iter=2000, class_weight="balanced"))
+    (
+        "classifier",
+        LogisticRegression(
+            max_iter=3000,
+            class_weight="balanced",
+            random_state=42,
+        ),
+    ),
 ])
+
 model.fit(X_train, y_train)
 
+# --------------------------------------------------
+# 3. EVALUATE THE MODEL
+# --------------------------------------------------
+
 y_pred = model.predict(X_test)
+
 accuracy = accuracy_score(y_test, y_pred) * 100
-cm = confusion_matrix(y_test, y_pred, labels=range(len(encoder.classes_)))
-report = classification_report(
-    y_test, y_pred, labels=range(len(encoder.classes_)),
-    target_names=encoder.classes_, zero_division=0
+class_names = list(label_encoder.classes_)
+
+def friendly_class(label):
+    """Convert dataset labels into readable class names."""
+    label = str(label).lower()
+
+    if label == "g":
+        return "Gamma (g)"
+    if label == "h":
+        return "Hadron (h)"
+
+    return label.upper()
+
+display_names = [friendly_class(name) for name in class_names]
+
+matrix = confusion_matrix(
+    y_test,
+    y_pred,
+    labels=list(range(len(class_names))),
 )
 
-numeric_columns = df.drop(columns=[target_column]).select_dtypes(include="number").columns.tolist()
-categorical_columns = df.drop(columns=[target_column]).select_dtypes(exclude="number").columns.tolist()
+matrix_df = pd.DataFrame(
+    matrix,
+    index=[f"Actual {name}" for name in display_names],
+    columns=[f"Predicted {name}" for name in display_names],
+)
 
-def predict_burnout(*values):
-    row = {}
-    for col, value in zip(df.drop(columns=[target_column]).columns, values):
-        row[col] = value
-    applicant = pd.DataFrame([row])
-    applicant = pd.get_dummies(applicant, drop_first=False)
-    applicant = applicant.reindex(columns=X.columns, fill_value=0)
-    prediction = model.predict(applicant)[0]
-    probabilities = model.predict_proba(applicant)[0]
-    confidence = probabilities[prediction] * 100
-    decision = encoder.inverse_transform([prediction])[0]
-    return str(decision), f"{confidence:.2f}%", f"{accuracy:.2f}%", pd.DataFrame(
-        cm,
-        index=[f"Actual {c}" for c in encoder.classes_],
-        columns=[f"Predicted {c}" for c in encoder.classes_]
-    ), report
+report = classification_report(
+    y_test,
+    y_pred,
+    labels=list(range(len(class_names))),
+    target_names=display_names,
+    zero_division=0,
+)
 
-css = """
-.gradio-container {
-    max-width: 1200px !important;
-    margin: auto !important;
-}
-"""
+metrics_text = (
+    f"LOGISTIC REGRESSION MODEL RESULTS\n"
+    f"{'=' * 38}\n"
+    f"Dataset: MAGIC Gamma Telescope.csv\n"
+    f"Usable rows: {len(X)}\n"
+    f"Features: {X.shape[1]}\n"
+    f"Training samples: {len(X_train)}\n"
+    f"Testing samples: {len(X_test)}\n"
+    f"Test accuracy: {accuracy:.2f}%\n\n"
+    f"CONFUSION MATRIX\n"
+    f"{matrix_df.to_string()}\n\n"
+    f"CLASSIFICATION REPORT\n"
+    f"{report}"
+)
 
-with gr.Blocks(
-    theme=gr.themes.Soft(
-        primary_hue="indigo",
-        secondary_hue="blue",
-        neutral_hue="slate"
-    ),
-    css=css,
-    title="Student Mental Health & Burnout AI"
-) as demo:
-    gr.Markdown("""
-    # 🧠 Student Mental Health & Burnout Prediction
-    ### Logistic Regression · Machine Learning Dashboard
-    Enter student information to predict the dataset's target category.
-    """)
+# --------------------------------------------------
+# 4. CREATE GRADIO PREDICTION FUNCTION
+# --------------------------------------------------
 
-    inputs = []
+# Use training-set medians as sensible starting values.
+defaults = X_train.median()
 
-    with gr.Row():
-        with gr.Column():
-            gr.Markdown("### Student Information")
-            for col in df.drop(columns=[target_column]).columns:
-                if col in numeric_columns:
-                    component = gr.Number(
-                        label=col.replace("_", " ").title(),
-                        value=float(df[col].median())
-                    )
-                else:
-                    options = sorted(df[col].astype(str).unique().tolist())
-                    component = gr.Dropdown(
-                        choices=options,
-                        value=options[0] if options else None,
-                        label=col.replace("_", " ").title()
-                    )
-                inputs.append(component)
-
-            predict_btn = gr.Button(
-                "Predict Burnout Category",
-                variant="primary",
-                size="lg"
+def predict_telescope_class(*values):
+    try:
+        if any(value is None for value in values):
+            return (
+                "Please enter a value for every feature.",
+                "",
             )
 
-        with gr.Column():
-            gr.Markdown("### Prediction Results")
-            prediction_output = gr.Textbox(label="Predicted Category", interactive=False)
-            confidence_output = gr.Textbox(label="Prediction Confidence", interactive=False)
-            accuracy_output = gr.Textbox(label="Test Accuracy", interactive=False)
-            confusion_output = gr.Dataframe(label="Confusion Matrix", interactive=False)
+        observation = pd.DataFrame(
+            [values],
+            columns=X.columns,
+        )
 
-    with gr.Accordion("Classification Report", open=False):
-        report_output = gr.Textbox(label="Precision, Recall and F1-Score", lines=12, interactive=False)
+        prediction_encoded = int(model.predict(observation)[0])
+        probabilities = model.predict_proba(observation)[0]
 
-    predict_btn.click(
-        fn=predict_burnout,
-        inputs=inputs,
-        outputs=[
-            prediction_output,
-            confidence_output,
-            accuracy_output,
-            confusion_output,
-            report_output
-        ]
+        predicted_label = label_encoder.inverse_transform(
+            [prediction_encoded]
+        )[0]
+
+        predicted_name = friendly_class(predicted_label)
+
+        probability_by_label = {
+            label_encoder.inverse_transform([index])[0]: float(probability)
+            for index, probability in enumerate(probabilities)
+        }
+
+        gamma_probability = probability_by_label.get("g", 0.0) * 100
+        hadron_probability = probability_by_label.get("h", 0.0) * 100
+
+        result = (
+            f"Predicted Class: {predicted_name}\n\n"
+            f"Gamma (g) probability: {gamma_probability:.2f}%\n"
+            f"Hadron (h) probability: {hadron_probability:.2f}%\n\n"
+            "Probabilities are estimates from the trained model."
+        )
+
+        return result, metrics_text
+
+    except Exception as error:
+        return f"Prediction error: {error}", metrics_text
+
+# --------------------------------------------------
+# 5. BUILD GRADIO USER INTERFACE
+# --------------------------------------------------
+
+input_components = []
+
+for column in X.columns:
+    default_value = float(defaults[column])
+
+    input_components.append(
+        gr.Number(
+            label=column,
+            value=default_value,
+            precision=6,
+        )
     )
 
-    gr.Markdown("""
-    ---
-    **Disclaimer:** This is an educational machine-learning demonstration.
-    Predictions are not a medical diagnosis or a substitute for professional support.
-    """)
+with gr.Blocks(theme=gr.themes.Soft(), title="MAGIC Telescope AI Classifier") as demo:
+
+    gr.Markdown(
+        """
+        # MAGIC Gamma Telescope Classifier
+        ### Supervised Machine Learning — Logistic Regression
+
+        Enter the telescope measurement values to classify an observation
+        as **Gamma (g)** or **Hadron (h)**.
+
+        The initial input values are feature medians from the training data.
+        """
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Telescope Measurements")
+
+            inputs_per_row = 2
+            for start in range(0, len(input_components), inputs_per_row):
+                with gr.Row():
+                    for component in input_components[
+                        start:start + inputs_per_row
+                    ]:
+                        component.render()
+
+            predict_button = gr.Button(
+                "Predict Class",
+                variant="primary",
+                size="lg",
+            )
+
+            clear_button = gr.Button("Reset to Default Values")
+
+        with gr.Column(scale=1):
+            gr.Markdown("### Prediction Result")
+
+            prediction_output = gr.Textbox(
+                label="Classification",
+                lines=7,
+                interactive=False,
+            )
+
+            gr.Markdown("### Model Evaluation")
+
+            evaluation_output = gr.Textbox(
+                label="Accuracy, Confusion Matrix and Classification Report",
+                value=metrics_text,
+                lines=24,
+                interactive=False,
+            )
+
+    predict_button.click(
+        fn=predict_telescope_class,
+        inputs=input_components,
+        outputs=[prediction_output, evaluation_output],
+    )
+
+    clear_button.click(
+        fn=lambda: [float(defaults[column]) for column in X.columns],
+        inputs=[],
+        outputs=input_components,
+    )
+
+    gr.Markdown(
+        """
+        ---
+        **Note:** This is an educational machine-learning demonstration.
+        Predicted probabilities are model estimates, not guaranteed certainty.
+        """
+    )
+
+# --------------------------------------------------
+# 6. LAUNCH APPLICATION
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    print("Dataset:", len(df), "records")
-    print("Target column:", target_column)
-    print("Classes:", list(encoder.classes_))
+    print(f"Dataset loaded: {CSV_PATH.name}")
+    print(f"Dataset shape: {df.shape}")
+    print(f"Features: {list(X.columns)}")
     print(f"Test accuracy: {accuracy:.2f}%")
     demo.launch()

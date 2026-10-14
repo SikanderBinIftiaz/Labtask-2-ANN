@@ -1,243 +1,80 @@
 import gradio as gr
 import pandas as pd
-
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    classification_report
-)
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
-# =========================================================
-# 1. LOAD AND VALIDATE DATASET
-# =========================================================
-
-df = pd.read_csv("dataset.csv")
+df = pd.read_csv("framingham.csv")
+df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
 df = df.drop_duplicates().dropna().reset_index(drop=True)
 
-target_column = "loan_approved"
+target = "TenYearCHD"
 
-if target_column not in df.columns:
-    raise ValueError(
-        f"Dataset must contain a '{target_column}' column. "
-        f"Available columns: {list(df.columns)}"
-    )
+if target not in df.columns:
+    raise ValueError(f"Target column '{target}' not found. Available columns: {list(df.columns)}")
 
-feature_columns = [
-    "age",
-    "annual_income",
-    "credit_score",
-    "employment_years",
-    "existing_debt",
-    "savings"
-]
-
-missing_columns = [
-    col for col in feature_columns if col not in df.columns
-]
-
-if missing_columns:
-    raise ValueError(
-        f"Missing dataset columns: {missing_columns}"
-    )
-
-X = df[feature_columns]
-y = df[target_column]
+X = df.drop(columns=[target, "id"], errors="ignore")
+y = df[target].astype(int)
+X = pd.get_dummies(X, drop_first=False)
 
 if y.nunique() != 2:
-    raise ValueError(
-        "The loan_approved column must contain exactly two classes."
-    )
-
-# Support datasets where approval labels are 0/1 or Boolean.
-# The positive class is identified as 1 or True.
-classes = list(y.unique())
-
-if 1 in classes:
-    positive_class = 1
-elif True in classes:
-    positive_class = True
-else:
-    raise ValueError(
-        "The loan_approved column must use 1 for approved "
-        "and 0 for not approved."
-    )
-
-if len(df) < 10 or y.value_counts().min() < 2:
-    raise ValueError(
-        "Dataset is too small or one class has too few examples "
-        "for a stratified train/test split."
-    )
-
-# =========================================================
-# 2. TRAIN LOGISTIC REGRESSION MODEL
-# =========================================================
+    raise ValueError("TenYearCHD must contain both 0 and 1 classes.")
 
 X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
+    X, y, test_size=0.2, random_state=42, stratify=y
 )
 
 model = Pipeline([
     ("scaler", StandardScaler()),
-    (
-        "classifier",
-        LogisticRegression(max_iter=1000, random_state=42)
-    )
+    ("classifier", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=42))
 ])
 
 model.fit(X_train, y_train)
-
 y_pred = model.predict(X_test)
-
 accuracy = accuracy_score(y_test, y_pred) * 100
-
-class_labels = list(model.named_steps["classifier"].classes_)
-
-cm = confusion_matrix(
-    y_test,
-    y_pred,
-    labels=class_labels
-)
-
+cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
 report = classification_report(
-    y_test,
-    y_pred,
-    labels=class_labels,
-    target_names=[
-        f"Not Approved ({class_labels[0]})",
-        f"Approved ({class_labels[1]})"
-    ],
-    zero_division=0
+    y_test, y_pred, labels=[0, 1],
+    target_names=["No CHD", "CHD"], zero_division=0
 )
 
-# =========================================================
-# 3. PREDICTION FUNCTION
-# =========================================================
+feature_columns = X.columns.tolist()
+original_features = df.drop(columns=[target, "id"], errors="ignore")
+numeric_features = original_features.select_dtypes(include="number").columns.tolist()
+categorical_features = original_features.select_dtypes(exclude="number").columns.tolist()
 
-def predict_loan(
-    age,
-    annual_income,
-    credit_score,
-    employment_years,
-    existing_debt,
-    savings
-):
-    values = [
-        age,
-        annual_income,
-        credit_score,
-        employment_years,
-        existing_debt,
-        savings
-    ]
-
-    if any(value is None for value in values):
-        return (
-            "Please enter all applicant details.",
-            "—",
-            f"{accuracy:.2f}%",
-            pd.DataFrame(),
-            report
-        )
-
-    if any(value < 0 for value in values):
-        return (
-            "Values cannot be negative.",
-            "—",
-            f"{accuracy:.2f}%",
-            pd.DataFrame(),
-            report
-        )
-
-    if not 18 <= age <= 100:
-        return (
-            "Age must be between 18 and 100.",
-            "—",
-            f"{accuracy:.2f}%",
-            pd.DataFrame(),
-            report
-        )
-
-    if not 300 <= credit_score <= 850:
-        return (
-            "Credit score must be between 300 and 850.",
-            "—",
-            f"{accuracy:.2f}%",
-            pd.DataFrame(),
-            report
-        )
-
-    new_data = pd.DataFrame(
-        [[
-            age,
-            annual_income,
-            credit_score,
-            employment_years,
-            existing_debt,
-            savings
-        ]],
-        columns=feature_columns
+def predict_chd(*values):
+    applicant = pd.DataFrame(
+        [values],
+        columns=original_features.columns
     )
+    applicant = pd.get_dummies(applicant, drop_first=False)
+    applicant = applicant.reindex(columns=feature_columns, fill_value=0)
+    applicant = applicant.astype(float)
 
-    prediction = model.predict(new_data)[0]
+    prediction = int(model.predict(applicant)[0])
+    probability = model.predict_proba(applicant)[0][1] * 100
 
-    probabilities = model.predict_proba(new_data)[0]
-
-    approval_index = class_labels.index(positive_class)
-
-    approval_probability = probabilities[approval_index] * 100
-
-    decision = (
-        "LOAN APPROVED"
-        if prediction == positive_class
-        else "LOAN NOT APPROVED"
-    )
-
-    confusion_df = pd.DataFrame(
-        cm,
-        index=[
-            f"Actual {label}"
-            for label in class_labels
-        ],
-        columns=[
-            f"Predicted {label}"
-            for label in class_labels
-        ]
-    )
+    decision = "Higher predicted CHD risk" if prediction == 1 else "Lower predicted CHD risk"
 
     return (
         decision,
-        f"{approval_probability:.2f}%",
+        f"{probability:.2f}%",
         f"{accuracy:.2f}%",
-        confusion_df,
+        pd.DataFrame(
+            cm,
+            index=["Actual No CHD", "Actual CHD"],
+            columns=["Predicted No CHD", "Predicted CHD"]
+        ),
         report
     )
 
-
-# =========================================================
-# 4. PROFESSIONAL GRADIO INTERFACE
-# =========================================================
-
 css = """
 .gradio-container {
-    max-width: 1150px !important;
+    max-width: 1200px !important;
     margin: auto !important;
-}
-
-#main-title {
-    text-align: center;
-    padding: 20px;
-}
-
-.result-box {
-    border-radius: 12px;
 }
 """
 
@@ -248,87 +85,65 @@ with gr.Blocks(
         neutral_hue="slate"
     ),
     css=css,
-    title="AI Loan Approval System"
+    title="Framingham CHD Risk Prediction"
 ) as demo:
 
     gr.Markdown("""
-    # 🏦 AI Loan Approval Prediction System
+    # ❤️ 10-Year CHD Risk Prediction
+    ### Logistic Regression · Framingham Dataset
 
-    ### Logistic Regression · Machine Learning Dashboard
-
-    Enter an applicant's financial details to generate a
-    prediction from your trained machine-learning model.
+    Enter the applicant's health and demographic information to obtain a model prediction.
     """)
 
+    inputs = []
+
     with gr.Row():
+        with gr.Column():
+            gr.Markdown("### Applicant Information")
 
-        with gr.Column(scale=1):
-            gr.Markdown("### 👤 Applicant Information")
+            for col in original_features.columns:
+                if col in numeric_features:
+                    default_value = float(original_features[col].median())
+                    minimum = float(original_features[col].min())
+                    maximum = float(original_features[col].max())
 
-            age = gr.Slider(
-                minimum=18,
-                maximum=100,
-                value=30,
-                step=1,
-                label="Age (years)"
-            )
+                    if minimum == maximum:
+                        maximum = minimum + 1
 
-            annual_income = gr.Number(
-                value=70000,
-                minimum=0,
-                label="Annual Income"
-            )
-
-            credit_score = gr.Slider(
-                minimum=300,
-                maximum=850,
-                value=750,
-                step=1,
-                label="Credit Score"
-            )
-
-            employment_years = gr.Slider(
-                minimum=0,
-                maximum=50,
-                value=5,
-                step=0.5,
-                label="Employment Experience (years)"
-            )
-
-            existing_debt = gr.Number(
-                value=5000,
-                minimum=0,
-                label="Existing Debt"
-            )
-
-            savings = gr.Number(
-                value=20000,
-                minimum=0,
-                label="Savings"
-            )
+                    component = gr.Number(
+                        label=col,
+                        value=default_value
+                    )
+                else:
+                    options = sorted(original_features[col].astype(str).unique().tolist())
+                    component = gr.Dropdown(
+                        choices=options,
+                        value=options[0] if options else None,
+                        label=col
+                    )
+                inputs.append(component)
 
             predict_btn = gr.Button(
-                "🔍 Predict Loan Approval",
+                "Predict 10-Year CHD Risk",
                 variant="primary",
                 size="lg"
             )
 
-        with gr.Column(scale=1):
-            gr.Markdown("### 📊 Prediction Results")
+        with gr.Column():
+            gr.Markdown("### Prediction Results")
 
             prediction_output = gr.Textbox(
-                label="Loan Decision",
-                interactive=False,
-                elem_classes=["result-box"]
+                label="Predicted Risk Category",
+                interactive=False
             )
 
             probability_output = gr.Textbox(
-                label="Probability of Approval",
+                label="Model-Estimated CHD Probability",
                 interactive=False
             )
 
             accuracy_output = gr.Textbox(
-                label="Model Test Accuracy",
+                label="Test Set Accuracy",
                 interactive=False
             )
 
@@ -337,28 +152,16 @@ with gr.Blocks(
                 interactive=False
             )
 
-    with gr.Accordion(
-        "Classification Report — Precision, Recall and F1-Score",
-        open=False
-    ):
-        # FIX: Use Textbox instead of Code(language="text").
+    with gr.Accordion("Classification Report", open=False):
         report_output = gr.Textbox(
-            label="Classification Report",
+            label="Precision, Recall and F1-Score",
             lines=10,
-            max_lines=20,
             interactive=False
         )
 
     predict_btn.click(
-        fn=predict_loan,
-        inputs=[
-            age,
-            annual_income,
-            credit_score,
-            employment_years,
-            existing_debt,
-            savings
-        ],
+        fn=predict_chd,
+        inputs=inputs,
         outputs=[
             prediction_output,
             probability_output,
@@ -370,21 +173,13 @@ with gr.Blocks(
 
     gr.Markdown("""
     ---
-
-    **Disclaimer:** This application is an educational demonstration.
-    Model predictions are not suitable for real financial decisions.
-    The displayed accuracy measures performance on the test split;
-    it does not guarantee correct predictions for individual applicants.
+    **Disclaimer:** This application is for educational purposes only.
+    It is not a medical diagnosis or a substitute for professional medical advice.
+    Model-estimated probabilities may not reflect an individual's actual risk.
     """)
 
-
-# =========================================================
-# 5. LAUNCH APPLICATION
-# =========================================================
-
 if __name__ == "__main__":
-    print("Starting AI Loan Approval System...")
-    print(f"Dataset records: {len(df)}")
+    print("Dataset records:", len(df))
+    print("Features:", len(feature_columns))
     print(f"Test accuracy: {accuracy:.2f}%")
-
-    demo.launch() 
+    demo.launch()
